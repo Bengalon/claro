@@ -18,11 +18,20 @@ export function Orb({ size = 160, mode = "idle", level, className }: Props) {
     if (!level) return;
     let raf = 0;
     let smooth = 0;
-    const loop = () => {
-      const v = Math.max(0, Math.min(1, level()));
-      smooth = smooth * 0.7 + v * 0.3;
-      ref.current?.style.setProperty("--level", smooth.toFixed(3));
+    let last = 0;
+    let shown = -1;
+    const loop = (t: number) => {
       raf = requestAnimationFrame(loop);
+      if (t - last < 33) return; // ~30 fps is plenty and keeps phones smooth
+      last = t;
+      const v = Math.max(0, Math.min(1, level()));
+      // gentle envelope: rise moderately, fall slowly, so the orb breathes instead of jittering
+      smooth += (v - smooth) * (v > smooth ? 0.25 : 0.08);
+      const q = Math.round(smooth * 50) / 50;
+      if (q !== shown) {
+        shown = q;
+        ref.current?.style.setProperty("--level", q.toFixed(2));
+      }
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);

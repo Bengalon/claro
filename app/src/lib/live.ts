@@ -108,8 +108,9 @@ export class LiveTutor {
     return Math.min(1, Math.sqrt(sum / data.length) * 3);
   }
 
+  /** Still "speaking" for a short moment after the audio ends, so small network gaps don't flip the screen. */
   isPlaying() {
-    return this.ctx.currentTime < this.nextTime - 0.02;
+    return this.ctx.currentTime < this.nextTime + 0.7;
   }
 
   async start(body: Record<string, unknown>): Promise<{ ok: true } | { ok: false; error: StartError; data?: unknown }> {
@@ -255,8 +256,20 @@ export class LiveTutor {
     buffer.copyToChannel(samples, 0);
     const src = this.ctx.createBufferSource();
     src.buffer = buffer;
-    src.connect(this.outGain);
-    const at = Math.max(this.ctx.currentTime + 0.04, this.nextTime);
+    const now = this.ctx.currentTime;
+    // Jitter buffer: when the queue ran dry (start of a turn, or a late packet on a phone network),
+    // wait a little before playing so the following chunks arrive in time and the voice doesn't stutter.
+    const underrun = this.nextTime < now + 0.03;
+    const at = underrun ? now + (this.nextTime === 0 ? 0.32 : 0.22) : this.nextTime;
+    if (underrun) {
+      // soft start avoids a click when audio resumes
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0, at);
+      g.gain.linearRampToValueAtTime(1, at + 0.012);
+      src.connect(g).connect(this.outGain);
+    } else {
+      src.connect(this.outGain);
+    }
     src.start(at);
     this.nextTime = at + buffer.duration;
     this.sources.add(src);
@@ -324,7 +337,7 @@ export class LiveTutor {
 
   /** Asks the tutor for a short explanation in Hebrew. */
   askHelp() {
-    this.sendText("[The student is asking for help: in ONE short Hebrew sentence explain what you just said and suggest a simple Spanish answer they can say.]");
+    this.sendText("[HELP]");
   }
 
   end() {

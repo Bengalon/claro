@@ -13,8 +13,8 @@
   border-radius: 50%;
   background: radial-gradient(circle, rgba(141, 108, 255, 0.38) 0%, rgba(255, 143, 177, 0.18) 45%, rgba(255, 255, 255, 0) 70%);
   filter: blur(6px);
-  transform: scale(calc(0.92 + var(--level) * 0.35));
-  transition: transform 0.08s linear;
+  transform: scale(calc(0.95 + var(--level) * 0.14));
+  will-change: transform;
   animation: halo 3.6s ease-in-out infinite;
 }
 
@@ -31,8 +31,8 @@
     inset -12px -16px 34px rgba(36, 10, 120, 0.4),
     inset 10px 12px 26px rgba(255, 255, 255, 0.35),
     0 22px 46px rgba(109, 74, 255, 0.38);
-  transform: scale(calc(1 + var(--level) * 0.09));
-  transition: transform 0.08s linear;
+  transform: scale(calc(1 + var(--level) * 0.035));
+  will-change: transform;
   animation: breathe 4.2s ease-in-out infinite;
 }
 
@@ -42,6 +42,7 @@
   background: conic-gradient(from 0deg, rgba(255, 255, 255, 0) 0deg, rgba(255, 190, 220, 0.5) 70deg, rgba(255, 255, 255, 0) 150deg, rgba(140, 220, 255, 0.4) 230deg, rgba(255, 255, 255, 0) 320deg);
   mix-blend-mode: screen;
   filter: blur(10px);
+  will-change: transform;
   animation: swirl 9s linear infinite;
   opacity: 0.75;
 }
@@ -83,7 +84,7 @@
 }
 
 .orb-speak .orb-mouth {
-  transform: scaleY(calc(1 + var(--level) * 1.6));
+  transform: scaleY(calc(1 + var(--level) * 0.9));
 }
 
 .orb-think .orb-swirl {

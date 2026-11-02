@@ -74,8 +74,14 @@ export default function Talk() {
     [],
   );
 
+  // keep the newest line in view without animating on every streamed word (that made the text jitter)
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+    const el = scrollRef.current;
+    if (!el) return;
+    const id = requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+    });
+    return () => cancelAnimationFrame(id);
   }, [lines]);
 
   const remaining = usedToday === null ? null : Math.max(0, allowance - usedToday);
@@ -204,7 +210,8 @@ export default function Talk() {
         </div>
 
         <div className="transcript" ref={scrollRef} aria-live="polite">
-          {lines.length === 0 && <p className="transcript-hint">{g(gen, "דבר בקצב שלך. אם נתקעת, אפשר לבקש עזרה בעברית.", "דברי בקצב שלך. אם נתקעת, אפשר לבקש עזרה בעברית.")}</p>}
+          {lines.length === 0 && <p className="transcript-hint">{g(gen, "דבר בקצב שלך. לא הבנת משהו? לחץ על \"לא הבנתי\" או תגיד את זה בעברית", "דברי בקצב שלך. לא הבנת משהו? לחצי על \"לא הבנתי\" או תגידי את זה בעברית")}
+              {tutorFem ? ", והיא תתרגם לך." : ", והוא יתרגם לך."}</p>}
           {lines.map((l) => (
             <motion.div key={l.id} className={`bubble ${l.who}`} initial={{ opacity: 0, y: 10, scale: 0.98 }} animate={{ opacity: 1, y: 0, scale: 1 }}>
               <span dir="auto">{l.text}</span>
@@ -229,9 +236,9 @@ export default function Talk() {
           <button className="call-btn end" onClick={() => tutorRef.current?.end()} aria-label="סיום שיחה">
             <IconPhoneOff />
           </button>
-          <button className="call-btn" onClick={() => tutorRef.current?.askHelp()} disabled={phase !== "call"} aria-label="עזרה בעברית">
+          <button className="call-btn" onClick={() => tutorRef.current?.askHelp()} disabled={phase !== "call"} aria-label="לא הבנתי: תרגום לעברית">
             <IconHelp />
-            <span>עזרה</span>
+            <span>לא הבנתי</span>
           </button>
         </div>
       </div>
