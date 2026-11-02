@@ -3,7 +3,7 @@ import { AnimatePresence, motion } from "motion/react";
 import { useStore } from "../lib/store";
 import { navigate } from "../lib/router";
 import { dueCards, nextNewWords } from "../lib/plan";
-import { graduateNew, knownCard, newCard, schedule, type Rating } from "../lib/srs";
+import { graduateNew, isDue, isKnown, knownCard, newCard, schedule, type Rating } from "../lib/srs";
 import { prefetchVoice, speak, stopSpeaking, ttsAvailable } from "../lib/tts";
 import { canType, checkTyped, type Verdict } from "../lib/answer";
 import { groupsByWord } from "../lib/content";
@@ -57,6 +57,36 @@ const nextKey = () => `k${++keySeq}`;
 
 export const EXTRA_NEW_KEY = "claro:extraNew";
 export const REVIEW_ONLY_KEY = "claro:reviewOnly";
+export const PRACTICE_KEY = "claro:practice";
+export const PRACTICE_SIZE = 15;
+
+const DAY_MS = 86_400_000;
+
+/**
+ * Free practice on words already learned: the ones most likely to be forgotten come first
+ * (often missed, low ease, short interval, not seen for a while), with a little randomness
+ * so each practice feels different.
+ */
+export function practiceWords(cards: Map<number, Card>, wordsById: Map<number, Word>, n: number): number[] {
+  const now = Date.now();
+  const scored = [...cards.values()]
+    .filter((c) => isKnown(c) && wordsById.has(c.word_id))
+    .map((c) => {
+      const since = c.last_review ? (now - new Date(c.last_review).getTime()) / DAY_MS : 30;
+      const weak = c.lapses * 1.5 + Math.max(0, 2.6 - c.ease) * 3 + (c.state === 2 ? 2 : 0) + 2 / (1 + c.interval_days);
+      return { id: c.word_id, score: weak + Math.min(3, since / 7) + Math.random() * 1.5 };
+    })
+    .sort((a, b) => b.score - a.score);
+  return shuffle(scored.slice(0, n).map((x) => x.id));
+}
+
+/** First question for a practice word: mostly typing the meaning, mixed with recall and listening. */
+function practiceStep(word: Word, i: number, canListen: boolean): Exclude<Step, "intro"> {
+  const want = (["type", "pick-es", "type", "listen"] as const)[i % 4];
+  if (want === "type" && !canType(word)) return "pick-es";
+  if (want === "listen" && !canListen) return "pick-he";
+  return want;
+}
 
 function ladderFor(word: Word, canListen: boolean): Exclude<Step, "intro">[] {
   return ["pick-he", canListen ? "listen" : "pick-es", canType(word) ? "type" : "pick-es"];
@@ -121,11 +151,31 @@ export default function Session() {
   const learners = useRef<Learner[]>([]);
   const counter = useRef(0);
   const roundIds = useRef<number[]>([]);
+  const [practice] = useState(() => {
+    const v = sessionStorage.getItem(PRACTICE_KEY);
+    sessionStorage.removeItem(PRACTICE_KEY);
+    return v ? Math.max(1, Number(v) || PRACTICE_SIZE) : 0;
+  });
   const [empty] = useState(() => {
     const extra = Number(sessionStorage.getItem(EXTRA_NEW_KEY) || 0);
     const reviewOnly = sessionStorage.getItem(REVIEW_ONLY_KEY) === "1";
     sessionStorage.removeItem(EXTRA_NEW_KEY);
     sessionStorage.removeItem(REVIEW_ONLY_KEY);
+    if (practice) {
+      const ids = practiceWords(cards, wordsById, practice);
+      learners.current = ids.map((id, i) => ({
+        wordId: id,
+        kind: "review",
+        ladder: [practiceStep(wordsById.get(id)!, i, canListen)],
+        pos: 0,
+        readyAt: i,
+        introduced: true,
+        failed: false,
+        done: false,
+      }));
+      roundIds.current = ids;
+      return ids.length === 0;
+    }
     const due = dueCards(cards).slice(0, MAX_REVIEWS);
     const nNew = reviewOnly ? 0 : extra > 0 ? extra : Math.min(NEW_PER_ROUND, Math.max(0, p.daily_new - newToday));
     const fresh = nextNewWords(words, cards, nNew);
@@ -297,7 +347,8 @@ export default function Session() {
       }
     } else if (learner.kind === "review" && !learner.failed) {
       if (correct) {
-        saveCard(schedule(card, 3));
+        // in free practice a word that isn't due yet keeps its schedule; a due word counts as its review
+        if (!practice || isDue(card)) saveCard(schedule(card, 3));
         finishedWord = true;
       } else {
         saveCard(schedule(card, 1)); // back to relearning
@@ -387,6 +438,10 @@ export default function Session() {
   });
 
   if (empty) return <EmptySession />;
+  if (finished && practice) {
+    const missed = learners.current.filter((l) => l.failed).map((l) => wordsById.get(l.wordId)!);
+    return <PracticeSummary xp={xp} total={total} missed={missed} stats={stats} gender={gen} accent={accent} />;
+  }
   if (finished) {
     return (
       <Summary
@@ -767,6 +822,68 @@ function Summary(props: {
       </button>
       <button className="btn btn-ghost btn-block" onClick={() => navigate("/", { replace: true })}>
         חזרה לבית
+      </button>
+    </div>
+  );
+}
+
+function PracticeSummary(props: {
+  xp: number;
+  total: number;
+  missed: Word[];
+  stats: { correct: number; answered: number; maxCombo: number };
+  gender: "m" | "f";
+  accent: "latam" | "spain";
+}) {
+  const { stats, missed, total } = props;
+  const acc = stats.answered ? Math.round((stats.correct / stats.answered) * 100) : 100;
+  const again = () => {
+    sessionStorage.setItem(PRACTICE_KEY, String(PRACTICE_SIZE));
+    navigate("/words", { replace: true });
+    window.setTimeout(() => navigate("/words/session"), 30);
+  };
+  return (
+    <div className="summary stack gap-16">
+      <motion.div className="summary-hero" initial={{ scale: 0.6, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={{ type: "spring", stiffness: 220, damping: 14 }}>
+        <Emoji3D emoji={missed.length === 0 ? "🏆" : "🧠"} size={140} eager />
+      </motion.div>
+      <h1 className="summary-title es center">{missed.length === 0 ? "¡Perfecto!" : "¡Bien hecho!"}</h1>
+      <p className="center muted" style={{ margin: 0 }}>
+        {missed.length === 0
+          ? g(props.gender, "זכרת את כל המילים. הזיכרון שלך חזק.", "זכרת את כל המילים. הזיכרון שלך חזק.")
+          : "חזרה כזאת היא מה ששומר את המילים בזיכרון."}
+      </p>
+      <div className="summary-grid">
+        <Stat emoji="🔁" value={total} label="מילים בחזרה" />
+        <Stat emoji="🧠" value={total - missed.length} label="זכרת מיד" />
+        <Stat emoji="🎯" value={`${acc}%`} label="דיוק" />
+        <Stat emoji="⚡" value={`+${props.xp}`} label="XP" />
+      </div>
+      {missed.length > 0 && (
+        <div className="card practice-missed">
+          <div className="practice-missed-head">
+            <b>מילים לחזק</b>
+            <span className="small muted">הן יחזרו אליך בחזרות הקרובות</span>
+          </div>
+          {missed.map((w) => (
+            <div key={w.id} className="practice-missed-row">
+              <Emoji3D emoji={w.emoji} size={32} />
+              <div className="stack grow">
+                <b className="es">{w.es}</b>
+                <span className="small muted">{w.he}</span>
+              </div>
+              <button className="speak-round" onClick={() => void speak(w.es, props.accent)} aria-label="השמעה">
+                <IconSpeaker />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      <button className="btn btn-primary btn-block" onClick={again}>
+        עוד חזרה
+      </button>
+      <button className="btn btn-ghost btn-block" onClick={() => navigate("/words", { replace: true })}>
+        חזרה למילים
       </button>
     </div>
   );

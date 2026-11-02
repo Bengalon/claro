@@ -435,6 +435,48 @@
   gap: 4px 10px;
 }
 
+.practice-card {
+  padding: 18px 18px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.practice-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.practice-head .h3 {
+  margin: 0 0 2px;
+}
+
+.practice-missed {
+  padding: 14px 16px 8px;
+  display: flex;
+  flex-direction: column;
+}
+
+.practice-missed-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-bottom: 8px;
+}
+
+.practice-missed-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line, rgba(31, 26, 68, 0.08));
+}
+
+.practice-missed-row .es {
+  font-size: 18px;
+}
+
 .words-progress {
   padding: 16px 18px 18px;
   display: flex;

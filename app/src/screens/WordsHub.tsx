@@ -6,7 +6,7 @@ import { todayPlan } from "../lib/plan";
 import { isKnown } from "../lib/srs";
 import { g } from "../lib/util";
 import { Emoji3D } from "../components/Emoji3D";
-import { EXTRA_NEW_KEY, REVIEW_ONLY_KEY } from "./Session";
+import { EXTRA_NEW_KEY, PRACTICE_KEY, PRACTICE_SIZE, REVIEW_ONLY_KEY } from "./Session";
 
 export default function WordsHub() {
   const { profile, cards, words, today, newToday, knownCount } = useStore();
@@ -30,9 +30,10 @@ export default function WordsHub() {
     return out;
   }, [words, cards]);
 
-  const start = (opts: { extra?: number; reviewOnly?: boolean } = {}) => {
+  const start = (opts: { extra?: number; reviewOnly?: boolean; practice?: number } = {}) => {
     if (opts.extra) sessionStorage.setItem(EXTRA_NEW_KEY, String(opts.extra));
     if (opts.reviewOnly) sessionStorage.setItem(REVIEW_ONLY_KEY, "1");
+    if (opts.practice) sessionStorage.setItem(PRACTICE_KEY, String(opts.practice));
     navigate("/words/session");
   };
 
@@ -84,6 +85,25 @@ export default function WordsHub() {
               </button>
             </div>
           </>
+        )}
+      </motion.section>
+
+      <motion.section className="card practice-card" initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.05 }}>
+        <div className="practice-head">
+          <Emoji3D emoji="🧠" size={48} eager />
+          <div className="stack">
+            <h2 className="h3">חזרה על מילים שלמדתי</h2>
+            <p className="small muted" style={{ margin: 0 }}>
+              {knownCount > 0
+                ? "תרגול כללי כדי לא לשכוח. מתחילים מהמילים שהכי קשות לך."
+                : g(p.gender, "אחרי שתלמד כמה מילים, אפשר לחזור עליהן כאן.", "אחרי שתלמדי כמה מילים, אפשר לחזור עליהן כאן.")}
+            </p>
+          </div>
+        </div>
+        {knownCount > 0 && (
+          <button className="btn btn-soft btn-block" onClick={() => start({ practice: PRACTICE_SIZE })}>
+            {knownCount >= PRACTICE_SIZE ? `חזרה על ${PRACTICE_SIZE} מילים` : `חזרה על ${knownCount === 1 ? "המילה" : `${knownCount} המילים`} שלמדתי`}
+          </button>
         )}
       </motion.section>
 
