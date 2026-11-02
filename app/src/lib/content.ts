@@ -10,12 +10,12 @@ export function loadContent() {
   if (!cache) {
     cache = Promise.all([import("../data/words.json"), import("../data/lessons.json"), import("../data/groups.json")]).then(([w, l, g]) => {
       groupsByWord.clear();
-      for (const grp of g.default as DiffGroup[]) {
+      for (const grp of g.default as unknown as DiffGroup[]) {
         for (const id of grp.words) groupsByWord.set(id, [...(groupsByWord.get(id) ?? []), grp]);
       }
       return {
-        words: (w.default as Word[]).slice().sort((a, b) => a.n - b.n),
-        lessons: (l.default as Lesson[]).slice().sort((a, b) => a.order - b.order),
+        words: (w.default as unknown as Word[]).slice().sort((a, b) => a.n - b.n),
+        lessons: (l.default as unknown as Lesson[]).slice().sort((a, b) => a.order - b.order),
       };
     });
   }

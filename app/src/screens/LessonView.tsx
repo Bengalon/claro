@@ -19,8 +19,8 @@ export default function LessonView({ id }: { id: string }) {
   const accent = profile?.accent;
   useEffect(() => {
     if (!lesson || !accent) return;
-    const texts: string[] = [];
-    for (const b of lesson.blocks) if (b.type === "examples") texts.push(...b.items.map((x) => x.es));
+    const texts: string[] = [...lesson.new_words.map((w) => w.es)];
+    for (const s of lesson.slides) texts.push(...(s.examples ?? []).map((x) => x.es));
     for (const q of lesson.quiz) if (q.type === "build") texts.push(q.answer);
     prefetchVoice(texts, accent);
   }, [lesson, accent]);
@@ -32,100 +32,243 @@ export default function LessonView({ id }: { id: string }) {
       </div>
     );
   }
-  return phase === "read" ? <Read lesson={lesson} onQuiz={() => setPhase("quiz")} /> : <Quiz lesson={lesson} />;
+  return phase === "read" ? <Read key={`r${lesson.id}`} lesson={lesson} onQuiz={() => setPhase("quiz")} /> : <Quiz key={`q${lesson.id}`} lesson={lesson} onRetry={() => setPhase("read")} />;
+}
+
+/** Spanish text where every word can be tapped for its meaning. */
+export function EsText({ text, lesson, onWord }: { text: string; lesson: Lesson; onWord: (es: string, he: string) => void }) {
+  const { wordsById } = useStore();
+  const parts = text.split(/([A-Za-zÀ-ÖØ-öø-ÿ]+)/);
+  return (
+    <span className="es es-text">
+      {parts.map((p, i) => {
+        if (i % 2 === 0) return p;
+        const low = p.toLowerCase();
+        const nw = lesson.new_words.find((w) => w.es.toLowerCase().split("/").some((f) => f.trim() === low));
+        const id = lesson.lex?.[low];
+        const he = nw?.he ?? (id !== undefined ? wordsById.get(id)?.he : undefined);
+        if (!he) return p;
+        return (
+          <span
+            key={i}
+            className="tok"
+            role="button"
+            tabIndex={0}
+            onClick={(e) => {
+              e.stopPropagation();
+              onWord(nw ? nw.es : wordsById.get(id!)!.es, he);
+            }}
+          >
+            {p}
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
+function useGloss() {
+  const [gloss, setGloss] = useState<{ es: string; he: string; k: number } | null>(null);
+  const timer = useRef<number | null>(null);
+  const show = (es: string, he: string) => {
+    setGloss({ es, he, k: Date.now() });
+    if (timer.current) window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => setGloss(null), 3500);
+  };
+  const hide = () => setGloss(null);
+  return { gloss, show, hide };
+}
+
+export function GlossBubble({ gloss, accent }: { gloss: { es: string; he: string; k: number } | null; accent: "latam" | "spain" }) {
+  return (
+    <AnimatePresence>
+      {gloss && (
+        <motion.button
+          key={gloss.k}
+          className="gloss"
+          initial={{ opacity: 0, y: 16, scale: 0.96 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: 10 }}
+          transition={{ type: "spring", stiffness: 420, damping: 30 }}
+          onClick={() => void speak(gloss.es, accent)}
+        >
+          <b className="es">{gloss.es}</b>
+          <span>=</span>
+          <span>{gloss.he}</span>
+          <IconSpeaker className="gloss-speaker" />
+        </motion.button>
+      )}
+    </AnimatePresence>
+  );
 }
 
 function Read({ lesson, onQuiz }: { lesson: Lesson; onQuiz: () => void }) {
-  const { profile, lessons } = useStore();
+  const { profile, cards, wordsById } = useStore();
   const accent = profile!.accent;
-  const idx = lessons.findIndex((l) => l.id === lesson.id);
-  return (
-    <div className="lesson stack gap-16">
-      <TopBar title={<span className="small muted">שיעור {lesson.order} מתוך {lessons.length}</span>} onBack={() => navigate("/lessons", { replace: true })} />
-      <motion.header className="lesson-head" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
-        <div className="floaty">
-          <Emoji3D emoji={lesson.emoji} size={96} eager />
-        </div>
-        <h1 className="h1">
-          <RichText text={lesson.title} />
-        </h1>
-        <p className="muted" style={{ margin: 0 }}>
-          {lesson.summary}
-        </p>
-        <span className="chip">⏱ {lesson.minutes} דקות</span>
-      </motion.header>
+  const gen = profile!.gender;
+  const [i, setI] = useState(0); // 0 = start page, then one page per slide
+  const { gloss, show, hide } = useGloss();
+  const pages = lesson.slides.length + 1;
 
-      {lesson.blocks.map((b, i) => (
-        <motion.section
+  // words in this lesson the learner hasn't learned yet
+  const toLearn = useMemo(() => {
+    const out: { es: string; he: string }[] = [...lesson.new_words];
+    for (const id of lesson.words ?? []) {
+      const c = cards.get(id);
+      const w = wordsById.get(id);
+      if (w && (!c || c.state === 0) && !out.some((x) => x.es === w.es)) out.push({ es: w.es, he: w.he });
+    }
+    return out.slice(0, 10);
+  }, [lesson, cards, wordsById]);
+
+  const go = (n: number) => {
+    sfx.tap();
+    hide();
+    setI(Math.max(0, Math.min(pages - 1, n)));
+    window.scrollTo({ top: 0 });
+  };
+  const slide = i > 0 ? lesson.slides[i - 1] : null;
+
+  return (
+    <div className="lesson">
+      <div className="lesson-top">
+        <button className="icon-btn" aria-label="חזרה לשיעורים" onClick={() => navigate("/lessons", { replace: true })}>
+          <IconClose />
+        </button>
+        <div className="lesson-dots" aria-label={`עמוד ${i + 1} מתוך ${pages}`}>
+          {Array.from({ length: pages }).map((_, k) => (
+            <span key={k} className={k < i ? "on" : k === i ? "now" : ""} />
+          ))}
+        </div>
+        <span className="small muted">
+          שיעור <span className="es">{lesson.order}</span>
+        </span>
+      </div>
+
+      <AnimatePresence mode="wait">
+        <motion.div
           key={i}
-          className={`lesson-block block-${b.type}`}
-          initial={{ opacity: 0, y: 14 }}
-          whileInView={{ opacity: 1, y: 0 }}
-          viewport={{ once: true, margin: "-30px" }}
-          transition={{ duration: 0.4 }}
+          className="lesson-page"
+          initial={{ opacity: 0, x: -24 }}
+          animate={{ opacity: 1, x: 0 }}
+          exit={{ opacity: 0, x: 24 }}
+          transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
         >
-          {b.type === "text" && (
-            <p className="lesson-text">
-              <RichText text={b.he} />
-            </p>
-          )}
-          {b.type === "tip" && (
-            <div className="lesson-tip">
-              <Emoji3D emoji="💡" size={34} />
-              <p>
-                <RichText text={b.he} />
-              </p>
-            </div>
-          )}
-          {b.type === "table" && (
-            <div className="table-wrap card">
-              <table className="lesson-table">
-                <thead>
-                  <tr>
-                    {b.head.map((h, j) => (
-                      <th key={j}>
-                        <RichText text={h} />
-                      </th>
+          {i === 0 ? (
+            <div className="stack gap-16">
+              <header className="lesson-head">
+                <div className="floaty">
+                  <Emoji3D emoji={lesson.emoji} size={84} eager />
+                </div>
+                <h1 className="h1">
+                  <RichText text={lesson.title} />
+                </h1>
+                <p className="lesson-goal">
+                  <RichText text={lesson.summary} />
+                </p>
+                <span className="chip">
+                  <span className="es">{lesson.slides.length}</span>&nbsp;שלבים קצרים ·&nbsp;<span className="es">{lesson.quiz.length}</span>&nbsp;שאלות
+                </span>
+              </header>
+              {toLearn.length > 0 && (
+                <section className="card words-first">
+                  <h2 className="h3">{g(gen, "מילים שתפגוש בשיעור", "מילים שתפגשי בשיעור")}</h2>
+                  <p className="small muted" style={{ margin: 0 }}>
+                    {g(gen, "עוד לא למדת אותן. אפשר ללחוץ כדי לשמוע.", "עוד לא למדת אותן. אפשר ללחוץ כדי לשמוע.")}
+                  </p>
+                  <div className="words-first-list">
+                    {toLearn.map((w) => (
+                      <button key={w.es} className="wf-row" onClick={() => void speak(w.es, accent)}>
+                        <b className="es">{w.es}</b>
+                        <span className="wf-he">{w.he}</span>
+                        <IconSpeaker className="example-speaker" />
+                      </button>
                     ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {b.rows.map((r, j) => (
-                    <tr key={j}>
-                      {r.map((cell, k) => (
-                        <td key={k}>
-                          <RichText text={cell} />
-                        </td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </div>
+                </section>
+              )}
             </div>
+          ) : (
+            slide && (
+              <section className="card slide">
+                <div className="slide-num small muted">
+                  <span className="es">{i}</span> מתוך <span className="es">{lesson.slides.length}</span>
+                </div>
+                <h2 className="h2">
+                  <RichText text={slide.title} />
+                </h2>
+                <p className="slide-text">
+                  <RichText text={slide.text} />
+                </p>
+                {slide.table && (
+                  <div className="table-wrap">
+                    <table className="lesson-table">
+                      <thead>
+                        <tr>
+                          {slide.table.head.map((h, j) => (
+                            <th key={j}>
+                              <RichText text={h} />
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {slide.table.rows.map((r, j) => (
+                          <tr key={j}>
+                            {r.map((cell, k) => (
+                              <td key={k}>{/[\u0590-\u05FF]/.test(cell) ? <RichText text={cell} /> : <EsText text={cell} lesson={lesson} onWord={show} />}</td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+                {!!slide.examples?.length && (
+                  <div className="slide-examples">
+                    {slide.examples.map((x, j) => (
+                      <div key={j} className="slide-ex">
+                        <button className="speak-round sm" onClick={() => void speak(x.es, accent)} aria-label="השמעה">
+                          <IconSpeaker />
+                        </button>
+                        <div className="stack grow">
+                          <EsText text={x.es} lesson={lesson} onWord={show} />
+                          <span className="example-he">{x.he}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {slide.tip && (
+                  <div className="word-note">
+                    <Emoji3D emoji="💡" size={24} eager />
+                    <span>
+                      <RichText text={slide.tip} />
+                    </span>
+                  </div>
+                )}
+                {i === 1 && <p className="tiny muted center" style={{ margin: 0 }}>{g(gen, "טיפ: לחץ על מילה בספרדית כדי לראות מה היא אומרת", "טיפ: לחצי על מילה בספרדית כדי לראות מה היא אומרת")}</p>}
+              </section>
+            )
           )}
-          {b.type === "examples" && (
-            <div className="lesson-examples">
-              {b.items.map((x, j) => (
-                <button key={j} className="example card" onClick={() => speak(x.es, accent)}>
-                  <span className="example-es es">
-                    {x.es}
-                    <IconSpeaker className="example-speaker" />
-                  </span>
-                  <span className="example-he">{x.he}</span>
-                </button>
-              ))}
-            </div>
-          )}
-        </motion.section>
-      ))}
+        </motion.div>
+      </AnimatePresence>
+
+      <GlossBubble gloss={gloss} accent={accent} />
 
       <div className="lesson-cta">
-        <button className="btn btn-primary btn-block" onClick={onQuiz}>
-          לתרגול ({lesson.quiz.length} שאלות)
-        </button>
-        {idx < lessons.length - 1 && (
-          <button className="btn btn-ghost btn-block btn-sm" onClick={() => navigate(`/lesson/${lessons[idx + 1].id}`, { replace: true })}>
-            לשיעור הבא בלי תרגול
+        {i < pages - 1 ? (
+          <button className="btn btn-primary btn-block" onClick={() => go(i + 1)}>
+            {i === 0 ? "בוא נתחיל" : "הבא"}
+          </button>
+        ) : (
+          <button className="btn btn-primary btn-block" onClick={onQuiz}>
+            לתרגול ({lesson.quiz.length} שאלות)
+          </button>
+        )}
+        {i > 0 && (
+          <button className="btn-link" onClick={() => go(i - 1)}>
+            חזרה
           </button>
         )}
       </div>
@@ -133,8 +276,9 @@ function Read({ lesson, onQuiz }: { lesson: Lesson; onQuiz: () => void }) {
   );
 }
 
-function Quiz({ lesson }: { lesson: Lesson }) {
+function Quiz({ lesson, onRetry }: { lesson: Lesson; onRetry: () => void }) {
   const { profile, completeLesson, addActivity, lessons } = useStore();
+  const { gloss, show: glossShow } = useGloss();
   const gen = profile!.gender;
   const [i, setI] = useState(0);
   const [correct, setCorrect] = useState(0);
@@ -201,9 +345,10 @@ function Quiz({ lesson }: { lesson: Lesson }) {
             </motion.span>
           ))}
         </div>
-        <h1 className="summary-title es center">{score >= 90 ? "¡Increíble!" : score >= 70 ? "¡Muy bien!" : "¡Buen trabajo!"}</h1>
+        <h1 className="summary-title es center">{score >= 90 ? "¡Increíble!" : score >= 70 ? "¡Muy bien!" : score >= 50 ? "¡Buen trabajo!" : "¡Casi!"}</h1>
         <p className="center muted" style={{ margin: 0 }}>
           {correct} מתוך {lesson.quiz.length} נכונות
+          {score < 60 ? " · כדאי לעבור שוב על השיעור" : ""}
         </p>
         <div className="summary-xp card">
           <Emoji3D emoji="⚡" size={40} eager />
@@ -212,8 +357,13 @@ function Quiz({ lesson }: { lesson: Lesson }) {
           </span>
           <span className="muted">XP</span>
         </div>
+        {score < 60 && (
+          <button className="btn btn-primary btn-block" onClick={onRetry}>
+            לעבור שוב על השיעור
+          </button>
+        )}
         {nextLesson ? (
-          <button className="btn btn-primary btn-block" onClick={() => navigate(`/lesson/${nextLesson.id}`, { replace: true })}>
+          <button className={`btn btn-block ${score < 60 ? "btn-soft" : "btn-primary"}`} onClick={() => navigate(`/lesson/${nextLesson.id}`, { replace: true })}>
             לשיעור הבא: <RichText text={nextLesson.title} />
           </button>
         ) : (
@@ -250,9 +400,10 @@ function Quiz({ lesson }: { lesson: Lesson }) {
           exit={{ opacity: 0, x: 36 }}
           transition={{ type: "spring", stiffness: 340, damping: 32 }}
         >
-          {q.type === "choice" ? <ChoiceQ q={q} result={result} onAnswer={answered} /> : <BuildQ q={q} result={result} onAnswer={answered} />}
+          {q.type === "choice" ? <ChoiceQ q={q} result={result} onAnswer={answered} lesson={lesson} onWord={glossShow} /> : <BuildQ q={q} result={result} onAnswer={answered} />}
         </motion.div>
       </AnimatePresence>
+      <GlossBubble gloss={gloss} accent={profile!.accent} />
       <AnimatePresence>
         {result !== null && (
           <motion.div
@@ -290,7 +441,7 @@ function Quiz({ lesson }: { lesson: Lesson }) {
   );
 }
 
-function ChoiceQ({ q, result, onAnswer }: { q: Extract<QuizItem, { type: "choice" }>; result: boolean | null; onAnswer: (ok: boolean) => void }) {
+function ChoiceQ({ q, result, onAnswer, lesson, onWord }: { q: Extract<QuizItem, { type: "choice" }>; result: boolean | null; onAnswer: (ok: boolean) => void; lesson: Lesson; onWord: (es: string, he: string) => void }) {
   const [chosen, setChosen] = useState<number | null>(null);
   return (
     <>
@@ -298,7 +449,11 @@ function ChoiceQ({ q, result, onAnswer }: { q: Extract<QuizItem, { type: "choice
         <div className="q-ask big">
           <RichText text={q.q} />
         </div>
-        {q.es && <div className="q-sentence es static">{q.es}</div>}
+        {q.es && (
+          <div className="q-sentence static">
+            <EsText text={q.es} lesson={lesson} onWord={onWord} />
+          </div>
+        )}
       </div>
       <div className="options">
         {q.options.map((o, idx) => {

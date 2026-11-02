@@ -64,8 +64,8 @@ export default function WordsHub() {
             <p className="muted" style={{ margin: 0 }}>
               {g(p.gender, "כל הכבוד! אם בא לך, אפשר ללמוד עוד כמה.", "כל הכבוד! אם בא לך, אפשר ללמוד עוד כמה.")}
             </p>
-            <button className="btn btn-primary btn-block" onClick={() => start({ extra: 5 })}>
-              עוד 5 מילים חדשות
+            <button className="btn btn-primary btn-block" onClick={() => start({ extra: 10 })}>
+              עוד 10 מילים חדשות
             </button>
           </>
         ) : (
@@ -79,8 +79,8 @@ export default function WordsHub() {
                   רק חזרות
                 </button>
               )}
-              <button className="btn-link" onClick={() => start({ extra: 5 })}>
-                להוסיף 5 מילים חדשות
+              <button className="btn-link" onClick={() => start({ extra: 10 })}>
+                סבב של 10 מילים חדשות
               </button>
             </div>
           </>

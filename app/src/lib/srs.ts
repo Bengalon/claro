@@ -114,3 +114,16 @@ export function dueLabel(card: Card, rating: Rating): string {
 /** A word counts as "known" once it has graduated from learning at least once. */
 export const isKnown = (c: Card | undefined) => !!c && (c.state === 1 || c.state === 2);
 export const isDue = (c: Card, now = Date.now()) => new Date(c.due_at).getTime() <= now;
+
+/** A new word that passed every step of a round: first review tomorrow. */
+export function graduateNew(card: Card, now = new Date()): Card {
+  return {
+    ...card,
+    state: 1,
+    step: 0,
+    reps: card.reps + 1,
+    interval_days: 1,
+    due_at: new Date(now.getTime() + DAY).toISOString(),
+    last_review: now.toISOString(),
+  };
+}

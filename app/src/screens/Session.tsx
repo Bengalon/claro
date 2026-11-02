@@ -3,8 +3,10 @@ import { AnimatePresence, motion } from "motion/react";
 import { useStore } from "../lib/store";
 import { navigate } from "../lib/router";
 import { dueCards, nextNewWords } from "../lib/plan";
-import { knownCard, newCard, schedule, type Rating } from "../lib/srs";
+import { graduateNew, knownCard, newCard, schedule, type Rating } from "../lib/srs";
 import { prefetchVoice, speak, stopSpeaking, ttsAvailable } from "../lib/tts";
+import { canType, checkTyped, type Verdict } from "../lib/answer";
+import { groupsByWord } from "../lib/content";
 import { haptic, sfx } from "../lib/sound";
 import { g, shuffle } from "../lib/util";
 import { toast } from "../lib/toast";
@@ -16,68 +18,93 @@ import { celebrate, CountUp } from "../components/ui";
 import { Orb } from "../components/Orb";
 
 /**
- * A word session, kept deliberately simple:
- *  - a new word is shown once on a clear card,
- *  - every other step is one question with four answers,
- *  - wrong answers come back a little later.
+ * A word round (up to 10 new words + due reviews).
+ * A new word only counts as learned after it passes every step, from easy to hard:
+ *   choose the meaning → recognise it by ear → type the meaning in Hebrew.
+ * A wrong answer sends the word one step back. The same word never comes twice in a row,
+ * and at most three new words are "in the air" at once, so the round really tests memory.
  */
-type Kind = "intro" | "pick-he" | "pick-es" | "listen";
-type Stage = "new" | "practice" | "review";
+type Step = "intro" | "pick-he" | "pick-es" | "listen" | "type";
+interface Learner {
+  wordId: number;
+  kind: "new" | "review";
+  ladder: Exclude<Step, "intro">[];
+  pos: number;
+  readyAt: number;
+  introduced: boolean;
+  failed: boolean;
+  done: boolean;
+}
 interface Item {
   key: string;
-  kind: Kind;
-  stage: Stage;
   wordId: number;
+  step: Step;
   options?: number[];
+  knownCheck?: boolean;
+}
+interface Pending {
+  correct: boolean;
+  verdict?: Verdict;
+  typed?: string;
+  gaveUp?: boolean;
 }
 
-const MAX_REVIEWS = 60;
+const NEW_PER_ROUND = 10;
+const MAX_REVIEWS = 20;
+const IN_FLIGHT = 3;
 let keySeq = 0;
 const nextKey = () => `k${++keySeq}`;
 
 export const EXTRA_NEW_KEY = "claro:extraNew";
 export const REVIEW_ONLY_KEY = "claro:reviewOnly";
 
-const STAGE_LABEL: Record<Stage, { emoji: string; text: string }> = {
-  new: { emoji: "✨", text: "מילה חדשה" },
-  practice: { emoji: "🎯", text: "תרגול" },
-  review: { emoji: "🔁", text: "חזרה על מילה" },
-};
-
-function pickKind(card: Card | undefined, canListen: boolean): Exclude<Kind, "intro"> {
-  const r = Math.random();
-  if (!card || card.state !== 2) {
-    if (canListen && r < 0.25) return "listen";
-    return r < 0.62 ? "pick-he" : "pick-es";
-  }
-  // well-known words: mostly "what does it mean?"
-  if (canListen && r < 0.3) return "listen";
-  return r < 0.75 ? "pick-he" : "pick-es";
+function ladderFor(word: Word, canListen: boolean): Exclude<Step, "intro">[] {
+  return ["pick-he", canListen ? "listen" : "pick-es", canType(word) ? "type" : "pick-es"];
 }
 
-function distractors(word: Word, words: Word[], kind: Kind): number[] {
-  const near = words.filter((w) => w.id !== word.id && Math.abs(w.n - word.n) < 250);
-  const samePos = near.filter((w) => w.pos === word.pos);
-  const pool = shuffle(samePos.length >= 6 ? samePos : near.length >= 6 ? near : words.filter((w) => w.id !== word.id));
-  const seen = new Set<string>([kind === "pick-es" ? word.es : word.he]);
-  const out: number[] = [];
-  for (const w of pool) {
-    const k = kind === "pick-es" ? w.es : w.he;
-    if (seen.has(k)) continue;
-    seen.add(k);
-    out.push(w.id);
-    if (out.length === 3) break;
+function editDistance(a: string, b: string) {
+  const p = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let d = p[0];
+    p[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const t = p[j];
+      p[j] = Math.min(p[j] + 1, p[j - 1] + 1, d + (a[i - 1] === b[j - 1] ? 0 : 1));
+      d = t;
+    }
   }
+  return p[b.length];
+}
+
+/**
+ * Wrong options that are actually tempting: words from this round, words with a similar meaning,
+ * and (for Spanish options) words that look alike.
+ */
+function pickOptions(word: Word, step: Step, words: Word[], wordsById: Map<number, Word>, roundIds: number[]): number[] {
+  const spanish = step === "pick-es";
+  const key = (w: Word) => (spanish ? w.es : w.he);
+  const seen = new Set([key(word)]);
+  const out: number[] = [];
+  const add = (w: Word | undefined) => {
+    if (!w || w.id === word.id || out.length >= 3 || seen.has(key(w))) return;
+    seen.add(key(w));
+    out.push(w.id);
+  };
+  // 1. a word with a similar meaning
+  for (const grp of groupsByWord.get(word.id) ?? []) for (const id of shuffle(grp.words)) if (out.length < 1) add(wordsById.get(id));
+  // 2. other words from this round with the same part of speech, then any from this round
+  const round = shuffle(roundIds.filter((id) => id !== word.id)).map((id) => wordsById.get(id)!);
+  round.filter((w) => w.pos === word.pos).forEach((w) => out.length < 2 && add(w));
+  // 3. nearby words: look-alikes for Spanish options, same part of speech for Hebrew options
+  const near = words.filter((w) => w.id !== word.id && Math.abs(w.n - word.n) < 300);
+  const pool = spanish
+    ? near.map((w) => ({ w, d: editDistance(w.es.toLowerCase(), word.es.toLowerCase()) })).sort((a, b) => a.d - b.d).slice(0, 10).map((x) => x.w)
+    : near.filter((w) => w.pos === word.pos);
+  shuffle(pool).forEach(add);
+  round.forEach(add);
+  shuffle(words).slice(0, 40).forEach(add);
   return shuffle([word.id, ...out]);
 }
-
-const makeItem = (wordId: number, kind: Exclude<Kind, "intro">, stage: Stage, word: Word, words: Word[]): Item => ({
-  key: nextKey(),
-  kind,
-  stage,
-  wordId,
-  options: distractors(word, words, kind),
-});
 
 export default function Session() {
   const store = useStore();
@@ -90,181 +117,249 @@ export default function Session() {
   const [sessionCards] = useState(() => new Map(cards));
   const startCoverage = useRef(coverage);
 
-  const [queue, setQueue] = useState<Item[]>(() => {
+  // ----- build the round -----
+  const learners = useRef<Learner[]>([]);
+  const counter = useRef(0);
+  const roundIds = useRef<number[]>([]);
+  const [empty] = useState(() => {
     const extra = Number(sessionStorage.getItem(EXTRA_NEW_KEY) || 0);
     const reviewOnly = sessionStorage.getItem(REVIEW_ONLY_KEY) === "1";
     sessionStorage.removeItem(EXTRA_NEW_KEY);
     sessionStorage.removeItem(REVIEW_ONLY_KEY);
     const due = dueCards(cards).slice(0, MAX_REVIEWS);
-    const nNew = reviewOnly ? 0 : Math.max(0, p.daily_new - newToday) + extra;
+    const nNew = reviewOnly ? 0 : extra > 0 ? extra : Math.min(NEW_PER_ROUND, Math.max(0, p.daily_new - newToday));
     const fresh = nextNewWords(words, cards, nNew);
-    const reviews: Item[] = due.map((c) => makeItem(c.word_id, pickKind(c, canListen), "review", wordsById.get(c.word_id)!, words));
-    const intros: Item[] = fresh.map((w) => ({ key: nextKey(), kind: "intro", stage: "new", wordId: w.id }));
-    const out: Item[] = [];
-    while (reviews.length || intros.length) {
-      out.push(...reviews.splice(0, 2));
-      if (intros.length) out.push(intros.shift()!);
-    }
-    return out;
+    const list: Learner[] = [];
+    due.forEach((c, i) => {
+      const w = wordsById.get(c.word_id);
+      if (!w) return;
+      list.push({ wordId: w.id, kind: "review", ladder: [canType(w) ? "type" : "pick-he"], pos: 0, readyAt: i * 2, introduced: true, failed: false, done: false });
+    });
+    fresh.forEach((w) => list.push({ wordId: w.id, kind: "new", ladder: ladderFor(w, canListen), pos: 0, readyAt: 0, introduced: false, failed: false, done: false }));
+    learners.current = list;
+    roundIds.current = list.map((l) => l.wordId);
+    return list.length === 0;
   });
 
-  const [done, setDone] = useState(0);
+  const [current, setCurrent] = useState<Item | null>(null);
+  const [doneCount, setDoneCount] = useState(0);
   const [xp, setXp] = useState(0);
   const [combo, setCombo] = useState(0);
   const [stats, setStats] = useState({ correct: 0, answered: 0, introduced: 0, maxCombo: 0 });
-  const [phase, setPhase] = useState<"question" | "feedback">("question");
+  const [pending, setPending] = useState<Pending | null>(null);
   const [chosen, setChosen] = useState<number | null>(null);
-  const [lastCorrect, setLastCorrect] = useState<boolean | null>(null);
-  const [lastXp, setLastXp] = useState(0);
   const [finished, setFinished] = useState(false);
   const [comboBanner, setComboBanner] = useState<number | null>(null);
-  const pending = useRef<Item | null>(null);
-  const empty = useRef(queue.length === 0);
-
-  const current = queue[0];
-  // guards against double taps answering or advancing the same step twice
-  const answeredKey = useRef<string | null>(null);
+  const lastWord = useRef<number | null>(null);
   const continuedKey = useRef<string | null>(null);
-  const word = current ? wordsById.get(current.wordId) : undefined;
-  const total = done + queue.length;
+  const answeredKey = useRef<string | null>(null);
 
-  const gainXp = useCallback((v: number) => {
-    if (v > 0) setXp((x) => x + v);
+  const total = learners.current.length;
+  const word = current ? wordsById.get(current.wordId) : undefined;
+  const learner = current ? learners.current.find((l) => l.wordId === current.wordId) : undefined;
+
+  /** Choose what comes next: introduce a new word while few are in the air, otherwise the word waiting longest. */
+  const pickNext = useCallback((): Item | null => {
+    const ls = learners.current;
+    const c = counter.current;
+    const active = ls.filter((l) => !l.done && l.introduced);
+    const inFlightNew = active.filter((l) => l.kind === "new").length;
+    const fresh = ls.find((l) => !l.done && !l.introduced);
+    const ready = active.filter((l) => l.readyAt <= c && l.wordId !== lastWord.current).sort((a, b) => a.readyAt - b.readyAt);
+    let pick: Learner | undefined;
+    if (fresh && inFlightNew < IN_FLIGHT && (ready.length === 0 || c % 2 === 0 || inFlightNew === 0)) {
+      return { key: nextKey(), wordId: fresh.wordId, step: "intro" };
+    }
+    pick = ready[0];
+    if (!pick && fresh) return { key: nextKey(), wordId: fresh.wordId, step: "intro" };
+    if (!pick) {
+      const waiting = active.filter((l) => l.wordId !== lastWord.current).sort((a, b) => a.readyAt - b.readyAt);
+      pick = waiting[0] ?? active[0];
+    }
+    if (!pick) return null;
+    const w = wordsById.get(pick.wordId)!;
+    const step = pick.ladder[pick.pos];
+    return {
+      key: nextKey(),
+      wordId: pick.wordId,
+      step,
+      options: step === "type" ? undefined : pickOptions(w, step, words, wordsById, roundIds.current),
+    };
+  }, [wordsById, words]);
+
+  const advance = useCallback(() => {
+    counter.current += 1;
+    const next = pickNext();
+    if (next) lastWord.current = next.wordId;
+    setCurrent(next);
+    setPending(null);
+    setChosen(null);
+    if (!next) setFinished(true);
+  }, [pickNext]);
+
+  // first item
+  useEffect(() => {
+    if (empty) return;
+    const first = pickNext();
+    if (first) lastWord.current = first.wordId;
+    setCurrent(first);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // say the word when a new word or a listening question appears
   useEffect(() => {
     if (!current || !word) return;
-    if (current.kind !== "listen" && current.kind !== "intro") return;
-    const t = window.setTimeout(() => void speak(word.es, accent), current.kind === "listen" ? 300 : 500);
+    if (current.step !== "listen" && current.step !== "intro") return;
+    const t = window.setTimeout(() => void speak(word.es, accent), current.step === "listen" ? 300 : 500);
     return () => window.clearTimeout(t);
   }, [current, word, accent]);
 
   useEffect(() => () => stopSpeaking(), []);
 
-  // download the voice for this step and the next one ahead of time
+  // download the voice for this round ahead of time
   useEffect(() => {
-    const texts = queue.slice(0, 3).flatMap((it) => {
-      const w = wordsById.get(it.wordId);
+    const texts = roundIds.current.slice(0, 14).flatMap((id) => {
+      const w = wordsById.get(id);
       return w ? [w.es, ...w.ex.map((x) => x.es)] : [];
     });
     if (texts.length) prefetchVoice(texts, accent);
-  }, [queue, wordsById, accent]);
+  }, [wordsById, accent]);
 
-  const advance = useCallback((reinsert?: Item | null) => {
-    setQueue((q) => {
-      const rest = q.slice(1);
-      if (reinsert) {
-        const pos = Math.min(rest.length, 3 + Math.floor(Math.random() * 3));
-        rest.splice(pos, 0, reinsert);
-      }
-      return rest;
-    });
-    setDone((d) => d + 1);
-    setPhase("question");
-    setChosen(null);
-    setLastCorrect(null);
-  }, []);
+  const gainXp = useCallback((v: number) => v > 0 && setXp((x) => x + v), []);
 
-  const repeats = useRef(new Map<number, number>());
-  const followUp = useCallback(
-    (card: Card): Item | null => {
-      const soon = new Date(card.due_at).getTime() - Date.now() < 20 * 60_000;
-      if (!soon) return null;
-      // a word comes back at most 3 times in one session; after that it waits for the next session
-      const n = repeats.current.get(card.word_id) ?? 0;
-      if (n >= 3) return null;
-      repeats.current.set(card.word_id, n + 1);
-      return makeItem(card.word_id, pickKind(card, canListen), "practice", wordsById.get(card.word_id)!, words);
-    },
-    [wordsById, words, canListen],
-  );
-
-  const grade = useCallback(
-    (rating: Rating) => {
-      if (!current) return { next: null as Card | null, earned: 0 };
-      const prev = sessionCards.get(current.wordId) ?? newCard(current.wordId);
-      const next = schedule(prev, rating);
-      sessionCards.set(current.wordId, next);
-      saveCards([next]);
-      logReview(current.wordId, rating);
-      const correct = rating >= 3;
-      const newCombo = correct ? combo + 1 : 0;
-      setCombo(newCombo);
-      const earned = correct ? 3 + (newCombo >= 5 ? 1 : 0) : 0;
-      gainXp(earned);
-      addActivity({ reviews: 1, xp: earned });
-      setStats((s) => ({
-        ...s,
-        answered: s.answered + 1,
-        correct: s.correct + (correct ? 1 : 0),
-        maxCombo: Math.max(s.maxCombo, newCombo),
-      }));
-      if (correct && (newCombo === 5 || newCombo === 10 || newCombo === 20)) {
-        setComboBanner(newCombo);
-        sfx.levelUp();
-        window.setTimeout(() => setComboBanner(null), 1600);
-      }
-      return { next, earned };
-    },
-    [current, sessionCards, saveCards, logReview, combo, gainXp, addActivity],
-  );
-
-  function onIntro(known: boolean) {
-    if (!current || !word || answeredKey.current === current.key) return;
-    answeredKey.current = current.key;
-    sfx.tap();
-    const card = known ? knownCard(word.id) : newCard(word.id);
-    sessionCards.set(word.id, card);
-    saveCards([card]);
-    const earned = known ? 1 : 2;
-    gainXp(earned);
-    addActivity({ new_words: 1, xp: earned });
-    setStats((s) => ({ ...s, introduced: s.introduced + 1 }));
-    if (known) advance(null);
-    else advance(makeItem(word.id, canListen && Math.random() < 0.3 ? "listen" : "pick-he", "practice", word, words));
+  function saveCard(c: Card) {
+    sessionCards.set(c.word_id, c);
+    saveCards([c]);
   }
 
-  function onPick(optionId: number) {
-    if (!current || !word || phase !== "question" || answeredKey.current === current.key) return;
+  // ----- answering -----
+  function answer(p: Pending) {
+    if (!current || answeredKey.current === current.key) return;
     answeredKey.current = current.key;
-    const correct = optionId === current.wordId;
-    setChosen(optionId);
-    setLastCorrect(correct);
-    setPhase("feedback");
-    if (correct) {
+    setPending(p);
+    if (p.correct) {
       sfx.correct(combo);
       haptic(10);
     } else {
       sfx.wrong();
       haptic(40);
     }
-    // hear the right answer once more
-    window.setTimeout(() => void speak(word.es, accent), correct ? 250 : 450);
-    const { next, earned } = grade(correct ? 3 : 1);
-    setLastXp(earned);
-    pending.current = next ? followUp(next) : null;
+    if (word) window.setTimeout(() => void speak(word.es, accent), p.correct ? 250 : 450);
+  }
+
+  function onPick(id: number) {
+    if (!current || pending) return;
+    setChosen(id);
+    answer({ correct: id === current.wordId });
+  }
+
+  function onTyped(text: string, gaveUp: boolean) {
+    if (!current || !word || pending) return;
+    const verdict: Verdict = gaveUp ? "wrong" : checkTyped(text, word);
+    answer({ correct: verdict !== "wrong", verdict, typed: text, gaveUp });
+  }
+
+  /** "I was right": the typed answer was a valid translation the list didn't have. */
+  function overrule() {
+    if (!pending || pending.correct) return;
+    setPending({ ...pending, correct: true, verdict: "right" });
+    sfx.correct(combo);
+  }
+
+  function apply(p: Pending) {
+    if (!current || !word || !learner) return;
+    const correct = p.correct;
+    const rating: Rating = correct ? 3 : 1;
+    logReview(word.id, rating);
+    const typedStep = current.step === "type";
+    const earned = correct ? (typedStep ? 5 : 3) + (combo >= 4 ? 1 : 0) : 0;
+    gainXp(earned);
+    addActivity({ reviews: 1, xp: earned });
+    const newCombo = correct ? combo + 1 : 0;
+    setCombo(newCombo);
+    setStats((s) => ({ ...s, answered: s.answered + 1, correct: s.correct + (correct ? 1 : 0), maxCombo: Math.max(s.maxCombo, newCombo) }));
+    if (correct && (newCombo === 5 || newCombo === 10 || newCombo === 20)) {
+      setComboBanner(newCombo);
+      sfx.levelUp();
+      window.setTimeout(() => setComboBanner(null), 1600);
+    }
+
+    const card = sessionCards.get(word.id) ?? newCard(word.id);
+    const typeStep: Exclude<Step, "intro"> = canType(word) ? "type" : "pick-es";
+    let finishedWord = false;
+
+    if (current.knownCheck) {
+      if (correct) {
+        saveCard(knownCard(word.id));
+        finishedWord = true;
+      } else {
+        learner.pos = 0; // learn it properly
+      }
+    } else if (learner.kind === "review" && !learner.failed) {
+      if (correct) {
+        saveCard(schedule(card, 3));
+        finishedWord = true;
+      } else {
+        saveCard(schedule(card, 1)); // back to relearning
+        learner.failed = true;
+        learner.ladder = ["pick-he", typeStep];
+        learner.pos = 0;
+      }
+    } else if (correct) {
+      learner.pos += 1;
+      if (learner.pos >= learner.ladder.length) {
+        finishedWord = true;
+        saveCard(learner.kind === "new" ? graduateNew(card) : schedule(card, 3));
+      }
+    } else {
+      learner.pos = Math.max(0, learner.pos - 1);
+      learner.failed = true;
+    }
+
+    if (finishedWord) {
+      learner.done = true;
+      setDoneCount((d) => d + 1);
+      if (learner.kind === "new") setStats((s) => ({ ...s, introduced: s.introduced + 1 }));
+    }
+    learner.readyAt = counter.current + (correct ? 3 : 2);
   }
 
   function onContinue() {
     if (!current || continuedKey.current === current.key) return;
     continuedKey.current = current.key;
     sfx.tap();
-    const re = pending.current;
-    pending.current = null;
-    advance(re);
+    if (pending) apply(pending);
+    advance();
   }
 
-  useEffect(() => {
-    if (queue.length === 0 && done > 0) setFinished(true);
-  }, [queue.length, done]);
+  function onIntro(knowIt: boolean) {
+    if (!current || !word || !learner || continuedKey.current === current.key) return;
+    continuedKey.current = current.key;
+    sfx.tap();
+    learner.introduced = true;
+    addActivity({ new_words: 1, xp: 1 });
+    gainXp(1);
+    if (!sessionCards.has(word.id)) saveCard(newCard(word.id));
+    if (knowIt) {
+      // prove it: type the meaning right now
+      counter.current += 1;
+      const step: Step = canType(word) ? "type" : "pick-he";
+      const item: Item = { key: nextKey(), wordId: word.id, step, knownCheck: true, options: step === "type" ? undefined : pickOptions(word, step, words, wordsById, roundIds.current) };
+      lastWord.current = word.id;
+      setCurrent(item);
+      setPending(null);
+      setChosen(null);
+      return;
+    }
+    learner.readyAt = counter.current + 2;
+    advance();
+  }
 
   // finish
   useEffect(() => {
-    if (!finished || empty.current) return;
-    const bonus = 10;
-    gainXp(bonus);
-    addActivity({ xp: bonus });
+    if (!finished || empty) return;
+    gainXp(10);
+    addActivity({ xp: 10 });
     sfx.complete();
     celebrate("big");
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -274,24 +369,24 @@ export default function Session() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!current) return;
-      if (phase === "feedback" && (e.key === "Enter" || e.key === " ")) {
+      if (pending && (e.key === "Enter" || e.key === " ") && !(e.target instanceof HTMLInputElement)) {
         e.preventDefault();
         onContinue();
         return;
       }
-      if (current.kind === "intro" && e.key === "Enter") {
+      if (current.step === "intro" && e.key === "Enter") {
         e.preventDefault();
         onIntro(false);
         return;
       }
       const n = Number(e.key);
-      if (n >= 1 && n <= 4 && current.options && phase === "question") onPick(current.options[n - 1]);
+      if (n >= 1 && n <= 4 && current.options && !pending && !(e.target instanceof HTMLInputElement)) onPick(current.options[n - 1]);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });
 
-  if (empty.current) return <EmptySession />;
+  if (empty) return <EmptySession />;
   if (finished) {
     return (
       <Summary
@@ -304,8 +399,16 @@ export default function Session() {
       />
     );
   }
-  if (!current || !word) return null;
-  const label = STAGE_LABEL[current.stage];
+  if (!current || !word || !learner) return null;
+
+  const stageLabel =
+    current.step === "intro"
+      ? { cls: "new", emoji: "✨", text: "מילה חדשה" }
+      : current.knownCheck
+        ? { cls: "review", emoji: "🧐", text: g(gen, "בוא נבדוק שאתה מכיר", "בואי נבדוק שאת מכירה") }
+        : learner.kind === "review" && !learner.failed
+          ? { cls: "review", emoji: "🔁", text: "חזרה על מילה" }
+          : { cls: "practice", emoji: "🎯", text: "תרגול" };
 
   return (
     <div className="session">
@@ -314,17 +417,19 @@ export default function Session() {
           className="icon-btn"
           aria-label="יציאה"
           onClick={() => {
-            if (done > 0) toast("ההתקדמות נשמרה", "good");
+            if (doneCount > 0 || stats.answered > 0) toast("ההתקדמות נשמרה", "good");
             navigate("/", { replace: true });
           }}
         >
           <IconClose />
         </button>
         <div className="bar grow" aria-hidden="true">
-          <span style={{ width: `${Math.max(4, (done / Math.max(1, total)) * 100)}%` }} />
+          <span style={{ width: `${Math.max(4, (doneCount / Math.max(1, total)) * 100)}%` }} />
         </div>
-        <span className="session-count es" aria-label={`${done} מתוך ${total}`}>
-          {done}/{total}
+        <span className="session-count" aria-label={`${doneCount} מתוך ${total} מילים`}>
+          <span className="es">
+            {doneCount}/{total}
+          </span>
         </span>
       </header>
 
@@ -339,7 +444,7 @@ export default function Session() {
           >
             <Emoji3D emoji="🔥" size={64} eager />
             <span className="es">{comboBanner}</span>
-            <span>{g(gen, "תשובות נכונות ברצף!", "תשובות נכונות ברצף!")}</span>
+            <span>תשובות נכונות ברצף!</span>
           </motion.div>
         )}
       </AnimatePresence>
@@ -353,12 +458,21 @@ export default function Session() {
           exit={{ opacity: 0, y: -10 }}
           transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
         >
-          <div className={`stage-tag ${current.stage}`}>
-            <Emoji3D emoji={label.emoji} size={20} eager />
-            {label.text}
+          <div className="stage-row">
+            <div className={`stage-tag ${stageLabel.cls}`}>
+              <Emoji3D emoji={stageLabel.emoji} size={20} eager />
+              {stageLabel.text}
+            </div>
+            {learner.kind === "new" && current.step !== "intro" && !current.knownCheck && (
+              <div className="ladder" aria-label={`שלב ${learner.pos + 1} מתוך ${learner.ladder.length}`}>
+                {learner.ladder.map((_, i) => (
+                  <span key={i} className={i < learner.pos ? "on" : i === learner.pos ? "now" : ""} />
+                ))}
+              </div>
+            )}
           </div>
 
-          {current.kind === "intro" && (
+          {current.step === "intro" && (
             <>
               <div className="card session-card">
                 <WordCard word={word} accent={accent} examples={1} diffCollapsed />
@@ -374,7 +488,7 @@ export default function Session() {
             </>
           )}
 
-          {current.kind === "pick-he" && (
+          {current.step === "pick-he" && (
             <Question
               ask="מה פירוש המילה?"
               prompt={
@@ -387,17 +501,17 @@ export default function Session() {
               chosen={chosen}
               answer={word.id}
               onPick={onPick}
-              phase={phase}
+              locked={!!pending}
             />
           )}
 
-          {current.kind === "pick-es" && (
+          {current.step === "pick-es" && (
             <Question
               ask="איך אומרים את זה בספרדית?"
               prompt={
                 <>
                   <div className="q-art">
-                    <Emoji3D emoji={word.emoji} size={104} eager />
+                    <Emoji3D emoji={word.emoji} size={96} eager />
                   </div>
                   <div className="q-he">{word.he}</div>
                 </>
@@ -406,18 +520,20 @@ export default function Session() {
               chosen={chosen}
               answer={word.id}
               onPick={onPick}
-              phase={phase}
+              locked={!!pending}
             />
           )}
 
-          {current.kind === "listen" && <ListenQuestion word={word} accent={accent} options={current.options!} chosen={chosen} phase={phase} onPick={onPick} />}
+          {current.step === "listen" && <ListenQuestion word={word} accent={accent} options={current.options!} chosen={chosen} locked={!!pending} onPick={onPick} />}
+
+          {current.step === "type" && <TypeQuestion key={current.key} word={word} accent={accent} locked={!!pending} onSubmit={onTyped} gender={gen} />}
         </motion.div>
       </AnimatePresence>
 
       <AnimatePresence>
-        {phase === "feedback" && lastCorrect !== null && (
+        {pending && (
           <motion.div
-            className={`feedback ${lastCorrect ? "good" : "bad"}`}
+            className={`feedback ${pending.correct ? "good" : "bad"}`}
             initial={{ y: "110%" }}
             animate={{ y: 0 }}
             exit={{ y: "110%" }}
@@ -425,14 +541,16 @@ export default function Session() {
             role="status"
           >
             <div className="feedback-head">
-              <span className="feedback-icon">{lastCorrect ? <IconCheck /> : <IconClose />}</span>
-              <span className="feedback-title">{lastCorrect ? "נכון!" : "התשובה הנכונה:"}</span>
-              {lastCorrect && lastXp > 0 && (
-                <motion.span className="feedback-xp es" initial={{ scale: 0.4, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} transition={{ delay: 0.1, type: "spring", stiffness: 500, damping: 16 }}>
-                  +{lastXp} XP
-                </motion.span>
-              )}
+              <span className="feedback-icon">{pending.correct ? <IconCheck /> : <IconClose />}</span>
+              <span className="feedback-title">
+                {pending.correct ? (pending.verdict === "close" ? "נכון, רק שימו לב לכתיב" : "נכון!") : pending.gaveUp ? "זאת התשובה:" : "לא בדיוק. התשובה:"}
+              </span>
             </div>
+            {current.step === "type" && pending.typed && !pending.gaveUp && (
+              <div className="feedback-typed">
+                כתבת: <b>{pending.typed}</b>
+              </div>
+            )}
             <div className="feedback-word">
               <Emoji3D emoji={word.emoji} size={44} eager />
               <div className="stack grow">
@@ -443,7 +561,12 @@ export default function Session() {
                 <IconSpeaker />
               </button>
             </div>
-            <button className={`btn btn-block ${lastCorrect ? "btn-good" : "btn-bad"}`} onClick={onContinue} autoFocus>
+            {!pending.correct && current.step === "type" && pending.typed && !pending.gaveUp && (
+              <button className="btn-link feedback-overrule" onClick={overrule}>
+                {g(gen, "כתבתי תרגום נכון אחר? סמן כנכון", "כתבתי תרגום נכון אחר? סמני כנכון")}
+              </button>
+            )}
+            <button className={`btn btn-block ${pending.correct ? "btn-good" : "btn-bad"}`} onClick={onContinue} autoFocus>
               המשך
             </button>
           </motion.div>
@@ -453,7 +576,71 @@ export default function Session() {
   );
 }
 
-function ListenQuestion(props: { word: Word; accent: "latam" | "spain"; options: number[]; chosen: number | null; phase: "question" | "feedback"; onPick: (id: number) => void }) {
+function TypeQuestion({ word, accent, locked, onSubmit, gender }: { word: Word; accent: "latam" | "spain"; locked: boolean; onSubmit: (text: string, gaveUp: boolean) => void; gender: "m" | "f" }) {
+  const [text, setText] = useState("");
+  const input = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const t = window.setTimeout(() => input.current?.focus(), 350);
+    return () => window.clearTimeout(t);
+  }, []);
+  const submit = () => {
+    if (locked) return;
+    if (!text.trim()) {
+      input.current?.focus();
+      return;
+    }
+    input.current?.blur();
+    onSubmit(text, false);
+  };
+  return (
+    <>
+      <div className="card session-card q-card">
+        <div className="q-ask">{g(gender, "כתוב בעברית מה זה אומר", "כתבי בעברית מה זה אומר")}</div>
+        <div className="q-es es">{word.es}</div>
+        <SpeakButtons text={word.es} accent={accent} size="sm" />
+      </div>
+      <form
+        className="type-box"
+        onSubmit={(e) => {
+          e.preventDefault();
+          submit();
+        }}
+      >
+        <input
+          ref={input}
+          className="input type-input"
+          dir="rtl"
+          lang="he"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="התרגום בעברית…"
+          autoComplete="off"
+          autoCorrect="off"
+          autoCapitalize="off"
+          spellCheck={false}
+          enterKeyHint="done"
+          disabled={locked}
+        />
+        <button type="submit" className="btn btn-primary btn-block" disabled={locked || !text.trim()}>
+          בדיקה
+        </button>
+        <button
+          type="button"
+          className="btn-link"
+          disabled={locked}
+          onClick={() => {
+            input.current?.blur();
+            onSubmit("", true);
+          }}
+        >
+          {g(gender, "לא זוכר", "לא זוכרת")}
+        </button>
+      </form>
+    </>
+  );
+}
+
+function ListenQuestion(props: { word: Word; accent: "latam" | "spain"; options: number[]; chosen: number | null; locked: boolean; onPick: (id: number) => void }) {
   const { word, accent } = props;
   const { wordsById } = useStore();
   const { playing, say } = useSpeaker(accent);
@@ -469,14 +656,14 @@ function ListenQuestion(props: { word: Word; accent: "latam" | "spain"; options:
             <Emoji3D emoji="🐢" size={22} eager />
             <span>לאט</span>
           </button>
-          {props.phase === "feedback" && <div className="q-es es small-es">{word.es}</div>}
+          {props.locked && <div className="q-es es small-es">{word.es}</div>}
         </div>
       }
       options={props.options.map((id) => ({ id, label: wordsById.get(id)!.he }))}
       chosen={props.chosen}
       answer={word.id}
       onPick={props.onPick}
-      phase={props.phase}
+      locked={props.locked}
     />
   );
 }
@@ -488,7 +675,7 @@ function Question(props: {
   chosen: number | null;
   answer: number;
   onPick: (id: number) => void;
-  phase: "question" | "feedback";
+  locked: boolean;
 }) {
   return (
     <>
@@ -498,15 +685,14 @@ function Question(props: {
       </div>
       <div className="options" role="list">
         {props.options.map((o, i) => {
-          const state =
-            props.phase === "feedback" ? (o.id === props.answer ? "right" : o.id === props.chosen ? "wrong" : "dim") : "";
+          const state = props.locked ? (o.id === props.answer ? "right" : o.id === props.chosen ? "wrong" : "dim") : "";
           return (
             <motion.button
               key={o.id}
               role="listitem"
               className={`option ${state}`}
               onClick={() => props.onPick(o.id)}
-              disabled={props.phase === "feedback"}
+              disabled={props.locked}
               initial={{ opacity: 0, y: 10 }}
               animate={
                 state === "wrong"
@@ -515,7 +701,7 @@ function Question(props: {
                     ? { scale: [1, 1.04, 1], opacity: 1, y: 0 }
                     : { opacity: 1, y: 0 }
               }
-              transition={{ delay: props.phase === "feedback" ? 0 : 0.04 + i * 0.04, duration: state ? 0.4 : 0.25 }}
+              transition={{ delay: props.locked ? 0 : 0.04 + i * 0.04, duration: state ? 0.4 : 0.25 }}
             >
               <span className="option-label">{o.label}</span>
               {state === "right" && (
@@ -602,7 +788,7 @@ function EmptySession() {
   const tutor = profile?.tutor_voice === "m" ? "Mateo" : "Lucía";
   const more = useMemo(
     () => () => {
-      sessionStorage.setItem(EXTRA_NEW_KEY, "5");
+      sessionStorage.setItem(EXTRA_NEW_KEY, "10");
       navigate("/words", { replace: true });
       window.setTimeout(() => navigate("/words/session"), 30);
     },
@@ -617,7 +803,7 @@ function EmptySession() {
           {g(gen, "סיימת את כל החזרות והמילים של היום. אפשר להמשיך עם עוד מילים, או לתרגל בשיחה.", "סיימת את כל החזרות והמילים של היום. אפשר להמשיך עם עוד מילים, או לתרגל בשיחה.")}
         </p>
         <button className="btn btn-primary btn-block" onClick={more}>
-          עוד 5 מילים חדשות
+          עוד 10 מילים חדשות
         </button>
         <button className="btn btn-soft btn-block" onClick={() => navigate("/talk", { replace: true })}>
           לדבר עם {tutor}

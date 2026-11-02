@@ -41,6 +41,14 @@ export type QuizItem =
   | { type: "choice"; q: string; es?: string; options: string[]; answer: number; explain: string }
   | { type: "build"; he: string; tokens: string[]; answer: string; extra?: string[] };
 
+export interface LessonSlide {
+  title: string;
+  text: string;
+  table?: { head: string[]; rows: string[][] };
+  examples?: { es: string; he: string }[];
+  tip?: string;
+}
+
 export interface Lesson {
   id: string;
   order: number;
@@ -48,8 +56,13 @@ export interface Lesson {
   title: string;
   summary: string;
   minutes: number;
-  blocks: LessonBlock[];
+  new_words: { es: string; he: string }[];
+  slides: LessonSlide[];
   quiz: QuizItem[];
+  /** ids of words from the 1,000 that appear in the lesson */
+  words: number[];
+  /** lower-case Spanish token → word id, for tap-to-translate */
+  lex: Record<string, number>;
 }
 
 export interface Profile {
