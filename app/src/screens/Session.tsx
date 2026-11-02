@@ -12,7 +12,7 @@ import { g, shuffle } from "../lib/util";
 import { toast } from "../lib/toast";
 import type { Card, Word } from "../lib/types";
 import { Emoji3D } from "../components/Emoji3D";
-import { SpeakButtons, useSpeaker, WordCard } from "../components/WordCard";
+import { ExampleLine, Highlighted, SpeakButtons, useSpeaker, WordCard } from "../components/WordCard";
 import { IconCheck, IconClose, IconSpeaker } from "../components/Icons";
 import { celebrate, CountUp } from "../components/ui";
 import { Orb } from "../components/Orb";
@@ -201,6 +201,13 @@ export default function Session() {
   const [finished, setFinished] = useState(false);
   const [comboBanner, setComboBanner] = useState<number | null>(null);
   const lastWord = useRef<number | null>(null);
+  const exPick = useRef(new Map<number, number>());
+  /** One example sentence per word for this round, picked at random so practice stays varied. */
+  const exampleOf = (w: Word) => {
+    if (!w.ex.length) return undefined;
+    if (!exPick.current.has(w.id)) exPick.current.set(w.id, Math.floor(Math.random() * w.ex.length));
+    return w.ex[exPick.current.get(w.id)!];
+  };
   const continuedKey = useRef<string | null>(null);
   const answeredKey = useRef<string | null>(null);
 
@@ -456,6 +463,9 @@ export default function Session() {
   }
   if (!current || !word || !learner) return null;
 
+  // words already learned get an example sentence: as a hint where it doesn't give the answer away, and in full after answering
+  const example = learner.kind === "review" ? exampleOf(word) : undefined;
+
   const stageLabel =
     current.step === "intro"
       ? { cls: "new", emoji: "✨", text: "מילה חדשה" }
@@ -550,6 +560,7 @@ export default function Session() {
                 <>
                   <div className="q-es es">{word.es}</div>
                   <SpeakButtons text={word.es} accent={accent} size="sm" />
+                  {example && <QContext ex={example} />}
                 </>
               }
               options={current.options!.map((id) => ({ id, label: wordsById.get(id)!.he }))}
@@ -581,7 +592,7 @@ export default function Session() {
 
           {current.step === "listen" && <ListenQuestion word={word} accent={accent} options={current.options!} chosen={chosen} locked={!!pending} onPick={onPick} />}
 
-          {current.step === "type" && <TypeQuestion key={current.key} word={word} accent={accent} locked={!!pending} onSubmit={onTyped} gender={gen} />}
+          {current.step === "type" && <TypeQuestion key={current.key} word={word} accent={accent} locked={!!pending} onSubmit={onTyped} gender={gen} context={example} />}
         </motion.div>
       </AnimatePresence>
 
@@ -616,6 +627,7 @@ export default function Session() {
                 <IconSpeaker />
               </button>
             </div>
+            {example && <FeedbackExample ex={example} accent={accent} />}
             {!pending.correct && current.step === "type" && pending.typed && !pending.gaveUp && (
               <button className="btn-link feedback-overrule" onClick={overrule}>
                 {g(gen, "כתבתי תרגום נכון אחר? סמן כנכון", "כתבתי תרגום נכון אחר? סמני כנכון")}
@@ -631,7 +643,43 @@ export default function Session() {
   );
 }
 
-function TypeQuestion({ word, accent, locked, onSubmit, gender }: { word: Word; accent: "latam" | "spain"; locked: boolean; onSubmit: (text: string, gaveUp: boolean) => void; gender: "m" | "f" }) {
+/** The example sentence in Spanish only, shown inside a question as context. */
+function QContext({ ex }: { ex: Word["ex"][number] }) {
+  return (
+    <div className="q-context">
+      <span className="q-context-label">במשפט:</span>
+      <span className="es" dir="ltr">
+        <Highlighted text={ex.es} hl={ex.hl} />
+      </span>
+    </div>
+  );
+}
+
+/** The full example (Spanish, Hebrew, audio) in the answer panel. */
+function FeedbackExample({ ex, accent }: { ex: Word["ex"][number]; accent: "latam" | "spain" }) {
+  const { playing, say } = useSpeaker(accent);
+  return (
+    <div className="feedback-example">
+      <ExampleLine ex={ex} accent={accent} id="fx" playing={playing} say={say} />
+    </div>
+  );
+}
+
+function TypeQuestion({
+  word,
+  accent,
+  locked,
+  onSubmit,
+  gender,
+  context,
+}: {
+  word: Word;
+  accent: "latam" | "spain";
+  locked: boolean;
+  onSubmit: (text: string, gaveUp: boolean) => void;
+  gender: "m" | "f";
+  context?: Word["ex"][number];
+}) {
   const [text, setText] = useState("");
   const input = useRef<HTMLInputElement>(null);
   useEffect(() => {
@@ -653,6 +701,7 @@ function TypeQuestion({ word, accent, locked, onSubmit, gender }: { word: Word; 
         <div className="q-ask">{g(gender, "כתוב בעברית מה זה אומר", "כתבי בעברית מה זה אומר")}</div>
         <div className="q-es es">{word.es}</div>
         <SpeakButtons text={word.es} accent={accent} size="sm" />
+        {context && <QContext ex={context} />}
       </div>
       <form
         className="type-box"

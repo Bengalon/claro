@@ -1151,6 +1151,40 @@
   overflow-wrap: anywhere;
 }
 
+.q-context {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: 100%;
+  padding: 10px 14px;
+  border-radius: 16px;
+  background: rgba(109, 74, 255, 0.06);
+}
+
+.q-context-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+.q-context .es {
+  font-size: 18px;
+  line-height: 1.4;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.feedback-example .example {
+  background: rgba(255, 255, 255, 0.7);
+  color: var(--ink);
+}
+
+.feedback-example .example:active,
+.feedback-example .example.playing {
+  background: #fff;
+}
+
 .q-es.small-es {
   font-size: 30px;
 }
