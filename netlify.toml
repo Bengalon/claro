@@ -1,0 +1,8 @@
+# Netlify builds the app from the "app" folder on every push.
+[build]
+  base = "app"
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "22"
